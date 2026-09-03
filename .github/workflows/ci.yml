@@ -1,0 +1,260 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  NODE_VERSION: '22'
+  DOCKER_PLATFORMS: linux/amd64,linux/arm64
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      # `nest build` uses tsconfig.build.json which excludes **/*spec.ts, and ts-jest/eslint don't
+      # full-program type-check specs — so without this gate, type errors in spec files are invisible
+      # to CI. tsconfig.json already includes both `src` and `test`, so this is the cheapest full-program
+      # check covering specs (no separate tsconfig.spec.json needed).
+      - name: Type-check full program (including specs)
+        run: npx tsc --noEmit -p tsconfig.json
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Check version consistency (docs track package.json)
+        run: npm run check:versions
+
+      # The builder stage ends with `COPY . .` — fail if .dockerignore stops rejecting non-build
+      # material (or starts rejecting a build input) before a Docker build finds out.
+      - name: Check Docker build context (.dockerignore)
+        run: npm run check:dockerignore
+
+      # The committed openapi.json is the machine-readable API contract. Fail if a controller/DTO
+      # change landed without regenerating the snapshot (npm run openapi:export). The generator
+      # bootstraps the app hermetically (in-memory/temp SQLite, no listen), so this is a static check.
+      - name: Check OpenAPI snapshot is up to date
+        run: npm run openapi:check
+
+      # Lives here, not in sdk-ci.yml: that workflow is path-filtered and does not list openapi.json,
+      # so a contract change alone runs none of it — and it never runs on a release tag at all.
+      - name: Check SDK routes against the contract
+        run: npm run check:sdk-routes
+
+      # The other direction. check:sdk-routes verifies every route an SDK builds exists in the
+      # contract; nothing verified that every route the contract publishes has a client method, and
+      # ten reached main without one. Fails PER SDK so a route three clients have and two do not is
+      # a failure rather than a healthy-looking total.
+      - name: Check the contract is covered by every SDK
+        run: npm run check:sdk-coverage
+
+      - name: Check SDK webhook events against the contract
+        run: npm run check:sdk-events
+
+      # Same reason again: a docs-only PR matches none of sdk-ci.yml's path filter, and the drift this
+      # catches is a documentation one — fourteen feature commits shipped a client method that the
+      # design doc never learned about.
+      - name: Check SDK docs cover the shipped client surface
+        run: npm run check:sdk-docs
+
+      # The shape half of the client contract gates above: routes/events/methods say WHICH
+      # endpoints exist, this says the hand-written SDK/dashboard types mirror the DTO schemas
+      # they carry — the verification none of the other gates provide.
+      - name: Client wire-shape contract check
+        run: npm run check:contract-shapes
+
+  # Deliberately its own job rather than a step inside Lint. `npm audit` reports against the
+  # advisory database, not against the diff, so a newly published advisory turns red on unrelated
+  # PRs. While it lived as the first step of Lint, that failure aborted the job before ESLint, the
+  # type-check, the format check, the version check and the OpenAPI drift gate ever ran — a
+  # dependency advisory silently switched off every code-quality gate. Split out, an advisory is
+  # still blocking (`build` needs it) but can no longer mask an unrelated result.
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          # Both trees are installed below, so both lockfiles belong in the cache key.
+          cache-dependency-path: |
+            package-lock.json
+            dashboard/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Security audit
+        # Same high (not critical) threshold, applied per advisory rather than all-or-nothing: an
+        # advisory with no patched version can be excused BY ID in scripts/check-audit.mjs, with its
+        # reason recorded, instead of lowering the bar for everything. The script also fails on an
+        # allowlist entry whose advisory has gone, so a carve-out cannot outlive its cause.
+        run: npm run check:audit
+
+      # The dashboard is a SECOND dependency tree, and it is the one that reaches a browser: its
+      # runtime deps are bundled into dashboard/dist, which the production image copies and serves.
+      # It went unscanned by every job in both the PR and the tag path — the image scan sees OS
+      # packages and the bundled output, not the npm graph behind it — so a HIGH advisory in a
+      # runtime dep could ride a release undetected. Audited here rather than as a step in the
+      # `dashboard` job for the same reason this job exists at all: an advisory must not abort that
+      # job's lint, typecheck, i18n, build and unit tests before they run.
+      - name: Install dashboard dependencies
+        run: cd dashboard && npm ci
+
+      - name: Security audit (dashboard)
+        run: cd dashboard && npm audit --audit-level=high
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    # Real Redis for the queue-on e2e suite (test/queue-on.e2e-spec.ts); the rest of the e2e family
+    # boots QUEUE_ENABLED=false and never connects. Mirrors the test-postgres job's service pattern;
+    # the image pin matches docker-compose.yml.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test -- --coverage
+
+      # Repo-file drift gates (docs, manifests, compose, workflows vs the code they describe). They
+      # read files and assert content — no runtime behavior — so they run as their own jest selection
+      # (`test:docs`) instead of padding the unit lane; `testPathIgnorePatterns` in package.json keeps
+      # the default run to behavioral suites only. The two lists must stay in sync.
+      # `--testPathIgnorePatterns` must stay AFTER the positional paths in `test:docs` — jest array
+      # options greedily consume trailing positionals.
+      - name: Run doc-lint tests
+        run: npm run test:docs
+
+      # node:test specs for the repo-level scripts (postinstall exit-code propagation) — jest's
+      # rootDir is src/, so these live outside its reach and run on the plain node runner.
+      - name: Run script unit tests
+        run: npm run test:scripts
+
+      - name: Run e2e smoke tests
+        run: npm run test:e2e
+        # Point the queue-on suite at the service container (it self-skips without one). Every other
+        # suite keeps QUEUE_ENABLED=false via setup-e2e.ts and never touches Redis.
+        env:
+          REDIS_HOST: localhost
+          REDIS_PORT: '6379'
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        if: always()
+        with:
+          files: ./coverage/lcov.info
+          fail_ci_if_error: false
+
+  test-postgres:
+    name: Test (PostgreSQL migrations)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: openwa
+          POSTGRES_PASSWORD: openwa
+          POSTGRES_DB: openwa
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openwa"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (compiles the data migrations to dist/)
+        run: npm run build
+
+      # Applies the full data-migration chain to a real Postgres and asserts every generated-uuid PK
+      # has a DB DEFAULT — the dialect gap SQLite-only tests can't see.
+      - name: Migrate + uuid-default smoke against PostgreSQL
+        run: npm run test:pg-smoke
+        env:
+          DATABASE_TYPE: postgres
+          DATABASE_HOST: localhost
+          DATABASE_PORT: '5432'
+          DATABASE_USERNAME: openwa
+          DATABASE_PASSWORD: openwa
+          DATABASE_NAME: openwa
+
+      # Runtime-proves BuiltInFtsProvider on Postgres (websearch_to_tsquery + ts_headline against the
+      # STORED body_ts tsvector), the boot-migration advisory lock (two concurrent migrators on one
+      # database), that a paged message list has a total order (Postgres sorts a tie group
+      # differently between two statements, so an unstable order drops rows from a page walk), and
+      # that the data entities can build their own schema (raw SQL the ORM passes through verbatim,
+      # such as a partial index predicate, only case-folds on a real server). All four self-skip
+      # unless DATABASE_TYPE=postgres, so they are a no-op in the default test job and only execute
+      # here against the postgres:16 service.
+      - name: Postgres specs (FTS provider + boot-migration lock + list ordering + entity synchronize)
+        # --runInBand: the specs issue DDL against the one shared service database, and jest's
+        # default file-parallelism races their catalog writes (pg_type duplicate-key). The lock
+        # spec's own two-migrator race is in-file (Promise.all) and unaffected by runInBand. The
+        # synchronize spec additionally CREATEs and DROPs a scratch database of its own, which is
+        # only safe serialized.
+        run: npx jest --runInBand src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts src/database/migrations/__tests__/pg-boot-migrations.pg.spec.ts src/modules/message/message-list-ordering.pg.spec.ts src/database/migrations/__tests__/pg-entity-synchronize.pg.spec.ts
+        env:
+          DATABASE_TYPE: postgres
+          DATABASE_HOST: localhost
+          DATABASE_PORT: '5432'
+          DATABASE_USERNAME: openwa
+          DATABASE_PASSWORD: openwa
+          DATABASE_NAME: openwa
+
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-latest
