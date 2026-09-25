@@ -13,7 +13,7 @@ if [[ "$(id -un)" != "ubuntu" ]]; then
   echo "Run this installer as ubuntu (without sudo). No changes made." >&2
   exit 1
 fi
-for cmd in git docker python3 sudo; do
+for cmd in git docker python3 sudo ss; do
   command -v "$cmd" >/dev/null || { echo "Missing required command: $cmd. No changes made." >&2; exit 1; }
 done
 docker compose version >/dev/null 2>&1 || { echo "Docker Compose is unavailable. No changes made." >&2; exit 1; }
@@ -24,8 +24,12 @@ if docker ps -a --format '{{.Names}}' | grep -qi 'openwa'; then
   echo "An OpenWA container already exists. Left it untouched; inspect before continuing." >&2
   exit 1
 fi
-if docker volume ls --format '{{.Name}}' | grep -qiE '(^|[-_])openwa([-_]|$)|(^|_)(openwa-data|postgres-data|redis-data|minio-data)$'; then
+if docker volume ls --format '{{.Name}}' | grep -qi 'openwa'; then
   echo "A possible existing OpenWA data volume was found. Left it untouched; inspect before continuing." >&2
+  exit 1
+fi
+if ss -ltnH | awk '{print $4}' | grep -Eq '(^|:)2785$'; then
+  echo "TCP port 2785 is already in use. Left it untouched; inspect before continuing." >&2
   exit 1
 fi
 if [[ -e "$ROOT" && ! -d "$ROOT/.git" ]]; then
